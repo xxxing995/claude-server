@@ -238,6 +238,7 @@ async function handleApi(request, env, ctx, url) {
     'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0],
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code',
+	'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
   const json = (data, status = 200) =>
