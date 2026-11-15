@@ -1,11 +1,3 @@
-// 前端的模型 id → 第三方接口里真实的模型名（按你的服务商填写）
-const MODEL_MAP = {
-  fable: 'deepseek-ai/DeepSeek-V4-Flash',
-  opus: '第三方的模型名B',
-  sonnet: '第三方的模型名C',
-  haiku: '第三方的模型名D',
-};
-
 const SYSTEM_PROMPT = '你是“我们的家”里温柔、简洁的陪伴助手，用中文回答一句话。';
 
 async function safeEqual(a, b) {
@@ -33,6 +25,209 @@ async function sb(env, method, path, body) {
   return text ? JSON.parse(text) : null;
 }
 
+// ---- 加解密：API 密钥加密后再存进数据库 ----
+async function aesKey(env) {
+  const raw = Uint8Array.from(atob(env.ENCRYPTION_KEY), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+async function encrypt(env, plain) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await aesKey(env), new TextEncoder().encode(plain)),
+  );
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv);
+  out.set(ct, iv.length);
+  return btoa(String.fromCharCode(...out));
+}
+async function decrypt(env, b64) {
+  const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: data.slice(0, 12) },
+    await aesKey(env),
+    data.slice(12),
+  );
+  return new TextDecoder().decode(plain);
+}
+
+// ---- 模型管理 ----
+const MODEL_COLS = 'id,provider_id,model_key,label,description,upstream_model,sort,is_default';
+
+async function listModels(env, json) {
+  try {
+    const rows = await sb(env, 'GET', `models?select=${MODEL_COLS}&order=sort.asc,id.asc`);
+    return json(rows || []); // 不返回密钥
+  } catch (e) {
+    console.log('list models error', e.message);
+    return json({ error: '读取模型失败' }, 500);
+  }
+}
+
+// 清理接口地址：必须 https，去掉结尾的 / 和 /v1
+function cleanBaseUrl(v) {
+  const s = typeof v === 'string' ? v.trim().slice(0, 200).replace(/\/+$/, '').replace(/\/v1$/, '') : '';
+  return /^https:\/\/\S+$/.test(s) ? s : '';
+}
+
+// 为模型生成固定的标识，如 gpt-4o-3fa2
+function makeKey(up) {
+  const base = up.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 22) || 'model';
+  const rand = Array.from(crypto.getRandomValues(new Uint8Array(2)), (x) => x.toString(16).padStart(2, '0')).join('');
+  return `${base}-${rand}`;
+}
+
+async function listProviders(env, json) {
+  try {
+    const rows = await sb(env, 'GET', 'providers?select=id,name,base_url&order=id.asc');
+    return json(rows || []); // 不返回密钥
+  } catch (e) {
+    console.log('list providers error', e.message);
+    return json({ error: '读取接口列表失败' }, 500);
+  }
+}
+
+// 步骤 3：短连接，读取这个接口有哪些模型。不保存任何东西
+async function discoverModels(request, env, json) {
+  let b;
+  try {
+    b = await request.json();
+  } catch {
+    return json({ error: '请求格式不正确' }, 400);
+  }
+  const baseUrl = cleanBaseUrl(b.base_url);
+  if (!baseUrl) return json({ error: 'API 地址需要以 https:// 开头' }, 400);
+
+  let apiKey = typeof b.api_key === 'string' ? b.api_key.trim() : '';
+  if (!apiKey) {
+    // 没输入密钥：编辑已有接口时，使用已保存的密钥（但地址不能变，否则会把密钥发到新地址）
+    const pid = Number(b.provider_id);
+    if (!Number.isInteger(pid) || pid <= 0) return json({ error: '请先输入密钥' }, 400);
+    try {
+      const rows = await sb(env, 'GET', `providers?id=eq.${pid}&select=base_url,api_key_enc&limit=1`);
+      if (!rows?.length) return json({ error: '没有找到这个接口' }, 404);
+      if (rows[0].base_url !== baseUrl) return json({ error: '更换 API 地址后，需要重新输入密钥' }, 400);
+      apiKey = await decrypt(env, rows[0].api_key_enc);
+    } catch (e) {
+      console.log('read key error', e.message);
+      return json({ error: '读取已保存的密钥失败' }, 500);
+    }
+  }
+
+  let res;
+  try {
+    res = await fetch(`${baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    return json({ error: '连接失败或超时，请检查 API 地址' }, 502);
+  }
+  if (res.status === 401 || res.status === 403) return json({ error: '密钥不正确或没有权限' }, 400);
+  if (!res.ok) return json({ error: `接口返回 ${res.status}` }, 502);
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return json({ error: '接口返回的不是有效的模型列表' }, 502);
+  }
+  const ids = (Array.isArray(data?.data) ? data.data : [])
+    .map((x) => x?.id)
+    .filter((x) => typeof x === 'string' && x)
+    .slice(0, 300);
+  if (!ids.length) return json({ error: '没有读取到模型列表（这个接口可能不支持列出模型）' }, 502);
+  return json({ models: [...new Set(ids)].sort() });
+}
+
+// 步骤 4：保存接口 + 勾选的模型。id 为 null 表示新增
+async function saveProvider(request, env, json, id) {
+  let b;
+  try {
+    b = await request.json();
+  } catch {
+    return json({ error: '请求格式不正确' }, 400);
+  }
+  const isNew = id === null;
+  const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+
+  const name = str(b.name, 30);
+  if (!name) return json({ error: '名称不能为空' }, 400);
+  const baseUrl = cleanBaseUrl(b.base_url);
+  if (!baseUrl) return json({ error: 'API 地址需要以 https:// 开头' }, 400);
+  const apiKey = str(b.api_key, 500);
+  if (isNew && !apiKey) return json({ error: '密钥不能为空' }, 400);
+
+  const desired = new Map(); // 真实模型名 → 显示名
+  for (const x of (Array.isArray(b.models) ? b.models : []).slice(0, 200)) {
+    const up = str(x?.upstream_model, 100);
+    if (up) desired.set(up, str(x?.label, 30) || up.slice(0, 30));
+  }
+  const defaultUp = str(b.default_upstream, 100);
+
+  try {
+    let providerId;
+    if (isNew) {
+      const created = await sb(env, 'POST', 'providers', {
+        name,
+        base_url: baseUrl,
+        api_key_enc: await encrypt(env, apiKey),
+      });
+      providerId = created[0].id;
+    } else {
+      providerId = Number(id);
+      const cur = await sb(env, 'GET', `providers?id=eq.${providerId}&select=base_url&limit=1`);
+      if (!cur?.length) return json({ error: '没有找到这个接口' }, 404);
+      if (cur[0].base_url !== baseUrl && !apiKey) {
+        return json({ error: '更换 API 地址后，需要重新输入密钥' }, 400);
+      }
+      const patch = { name, base_url: baseUrl };
+      if (apiKey) patch.api_key_enc = await encrypt(env, apiKey);
+      await sb(env, 'PATCH', `providers?id=eq.${providerId}`, patch);
+    }
+
+    // 同步模型：取消勾选的删除，已有的更新显示名，新勾选的添加
+    const existing = (await sb(env, 'GET', `models?provider_id=eq.${providerId}&select=id,upstream_model,label`)) || [];
+    const idByUp = new Map(existing.map((r) => [r.upstream_model, r.id]));
+
+    const removeIds = existing.filter((r) => !desired.has(r.upstream_model)).map((r) => r.id);
+    if (removeIds.length) await sb(env, 'DELETE', `models?id=in.(${removeIds.join(',')})`);
+
+    for (const r of existing) {
+      const label = desired.get(r.upstream_model);
+      if (label !== undefined && label !== r.label) {
+        await sb(env, 'PATCH', `models?id=eq.${r.id}`, { label });
+      }
+    }
+
+    const toInsert = [...desired]
+      .filter(([up]) => !idByUp.has(up))
+      .map(([up, label]) => ({ provider_id: providerId, model_key: makeKey(up), label, upstream_model: up }));
+    if (toInsert.length) {
+      const inserted = await sb(env, 'POST', 'models', toInsert);
+      for (const r of inserted) idByUp.set(r.upstream_model, r.id);
+    }
+
+    // 默认模型（全局只有一个）
+    if (defaultUp && desired.has(defaultUp) && idByUp.has(defaultUp)) {
+      await sb(env, 'PATCH', 'models?is_default=eq.true', { is_default: false });
+      await sb(env, 'PATCH', `models?id=eq.${idByUp.get(defaultUp)}`, { is_default: true });
+    } else {
+      // 全局还没有默认时，把这个接口的第一个设为默认
+      const hasDefault = await sb(env, 'GET', 'models?is_default=eq.true&select=id&limit=1');
+      const first = [...desired.keys()].find((up) => idByUp.has(up));
+      if (!hasDefault?.length && first) {
+        await sb(env, 'PATCH', `models?id=eq.${idByUp.get(first)}`, { is_default: true });
+      }
+    }
+
+    return json({ ok: true, id: providerId });
+  } catch (e) {
+    console.log('save provider error', e.message);
+    return json({ error: '保存失败' }, 500);
+  }
+}
+
+
 const DEFAULT_SETTINGS = { temperature: 0.7, max_context_rounds: 20, max_reply_tokens: 2000 };
 
 // 入口：跨域 + 访问口令 + 路由
@@ -41,7 +236,7 @@ async function handleApi(request, env, ctx, url) {
   const allowed = (env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim());
   const cors = {
     'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : allowed[0],
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Access-Code',
     Vary: 'Origin',
   };
@@ -65,12 +260,29 @@ async function handleApi(request, env, ctx, url) {
   if (path === '/api/chat/retract' && request.method === 'POST') {
 	return handleRetract(request, env, json);
   }
-
   let m = path.match(/^\/api\/messages\/(\d+)$/);
-  if (m && request.method === 'DELETE') return removeRow(env, 'messages', m[1], json);
+  if (path === '/api/models') {
+	if (request.method === 'GET') return listModels(env, json);
 
+	m = path.match(/^\/api\/models\/(\d+)$/);
+	if (m) {
+		if (request.method === 'DELETE') return removeRow(env, 'models', m[1], json);
+	}
+  }
   m = path.match(/^\/api\/sessions\/(\d+)$/);
   if (m && request.method === 'DELETE') return removeRow(env, 'sessions', m[1], json);
+	if (path === '/api/providers') {
+	if (request.method === 'GET') return listProviders(env, json);
+	if (request.method === 'POST') return saveProvider(request, env, json, null);
+  }
+  if (path === '/api/providers/discover' && request.method === 'POST') {
+	return discoverModels(request, env, json);
+  }
+  m = path.match(/^\/api\/providers\/(\d+)$/);
+  if (m) {
+	if (request.method === 'PATCH') return saveProvider(request, env, json, m[1]);
+	if (request.method === 'DELETE') return removeRow(env, 'providers', m[1], json); // 会连带删除它下面的模型
+  }
 
   return json({ error: 'Not found' }, 404);
 }
@@ -124,8 +336,28 @@ async function handleChat(request, env, ctx, cors, json) {
     return json({ error: '请求格式不正确' }, 400);
   }
 
-  const upstreamModel = MODEL_MAP[body.model];
-  if (!upstreamModel) return json({ error: '不支持的模型' }, 400);
+  if (typeof body.model !== 'string' || !/^[a-z0-9_-]{1,40}$/.test(body.model)) {
+	return json({ error: '不支持的模型' }, 400);
+  }
+  let cfg, apiKey;
+  try {
+	const mrows = await sb(
+		env,
+		'GET',
+		`models?model_key=eq.${body.model}&select=upstream_model,providers(base_url,api_key_enc)&limit=1`,
+	);
+	if (!mrows?.length || !mrows[0].providers) return json({ error: '不支持的模型，请在设置里添加' }, 400);
+	cfg = {
+		upstream_model: mrows[0].upstream_model,
+		base_url: mrows[0].providers.base_url,
+		api_key_enc: mrows[0].providers.api_key_enc,
+	};
+	apiKey = await decrypt(env, cfg.api_key_enc);
+  } catch (e) {
+	console.log('model config error', e.message);
+	return json({ error: '读取模型配置失败' }, 500);
+  }
+  const upstreamModel = cfg.upstream_model;
 
   let sessionId = body.session_id == null ? null : Number(body.session_id);
   if (sessionId !== null && !(Number.isInteger(sessionId) && sessionId > 0)) {
@@ -179,9 +411,9 @@ async function handleChat(request, env, ctx, cors, json) {
   const t0 = Date.now();
   let upstream;
   try {
-    upstream = await fetch(`${env.API_BASE_URL}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.API_KEY}` },
+    upstream = await fetch(`${cfg.base_url}/v1/chat/completions`, {
+	  method: 'POST',
+	  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: upstreamModel,
         stream: true,
