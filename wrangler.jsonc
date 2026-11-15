@@ -13,7 +13,8 @@
 	"upload_source_maps": true,
 	"vars": {
 		"API_BASE_URL": "https://api.siliconflow.cn",
-		"ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173,https://ssandc.netlify.app"
+		"ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173,https://ssandc.netlify.app",
+		"SUPABASE_URL": "https://jsubpihmelnjgmfrzqal.supabase.co"
 	}
 	/**
 	 * Smart Placement
