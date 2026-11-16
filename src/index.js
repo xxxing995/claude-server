@@ -1,4 +1,27 @@
 const SYSTEM_PROMPT = '你是“我们的家”里温柔、简洁的陪伴助手，用中文回答一句话。';
+// 回复方式：不管 settings.system_prompt 怎么配，都追加这段（只改提示词，不改接口）
+const REPLY_STYLE = `【回复方式】
+- 像网聊一样说话：默认只回一到两句，口语、短句，说完就停，不要写成一大段文章。
+- 不要复述她刚说过的话，也不要复述记忆条目里的原话，直接接话。
+- 只回应她最后一条消息：不要补答更早的提问，也不要把几个话题合在一起答；前面没说完的，这一轮也不补。
+- 需要接着说的时候，用一个空行另起一条，每条各自独立成句；最多再起两三条，总量要克制。
+- 空行只用来分隔消息，不要拿空行做排版，也不要把一句话拆成一堆碎句。`;
+
+// 当前现实时间：北京时间，放在易变尾部（历史之后、本轮用户消息之前），不参与前缀缓存
+function nowNote() {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    weekday: 'short',
+  }).formatToParts(new Date());
+  const g = (t) => parts.find((p) => p.type === t)?.value || '';
+  return `【现在】${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}（北京时间，${g('weekday')}）。这是系统提供的当前时间，不是她说的。`;
+}
 
 async function safeEqual(a, b) {
   const enc = new TextEncoder();
@@ -86,7 +109,7 @@ async function listMessages(env, sessionId, json) {
       env,
       'GET',
       `messages?session_id=eq.${sessionId}&visible=eq.true&role=in.(user,assistant)` +
-        '&select=id,role,content,reasoning_content,model,first_token_ms,total_ms,prompt_tokens,completion_tokens,total_tokens,finish_reason,sessions(updated_at)' +
+        '&select=id,role,content,reasoning_content,model,first_token_ms,total_ms,prompt_tokens,completion_tokens,total_tokens,finish_reason,created_at,sessions(updated_at)' +
         '&order=id.asc',
     );
     const list = rows || [];
@@ -291,7 +314,7 @@ const MEMORY_PINNED_LIMIT = 10;
 const PINNED_STATUSES = ['pending', 'agreed', 'done', 'cancelled'];
 const PINNED_STATUS_LABEL = { pending: '未决', agreed: '约定', done: '已完成', cancelled: '已取消' };
 const MEMORY_HEADER =
-  '以下是你和她之间真实发生过的事，属于你自己的经历，用来保持连续，不需要逐条复述。它们不是这一轮要回答的问题，也不要因为看到了就主动提起。';
+  '以下是你和她之间真实发生过的事，属于你自己的经历，用来保持连续，不需要逐条复述。它们不是这一轮要回答的问题，也不要因为看到了就主动提起。条目里以「我」写的是她的原话，出现「你」是她在对你说话，不要把这些话当成你自己刚说过的。';
 // 记忆消息的最后一行：贴住历史与本轮消息，避免指令离得太远
 const MEMORY_TAIL = '直接以他的身份和口吻回应，不要跳出角色解释自己是谁。';
 // 记账指令说明：不进两段预算，只在记忆开启时随记忆消息一起注入
@@ -506,6 +529,7 @@ async function buildContext(env, st, userText) {
     return {
       persona,
       memory: null,
+      hitsText: '',
       debug: {
         enabled: false,
         persona_chars: persona.length,
@@ -546,16 +570,18 @@ async function buildContext(env, st, userText) {
   const residentText = [core.text, pinnedBlock.text].filter(Boolean).join('\n\n');
   const hitsBlock = buildHitsBlock(hits, MEMORY_HITS_MAX);
 
-  // 两段各自独立裁剪后再拼成一条记忆消息，命中段不会挤掉常驻段；
-  // 记账说明不计入两段预算，记忆开启时始终附带，保证模型有写入通道。
+  // 两段各自独立裁剪后再拼：常驻段（身份/摘要/语气/pinned）进稳定前缀，
+  // 命中段挪出记忆消息，交给调用方放到历史之后、紧邻本轮用户消息的位置。
+  // 这样每轮变化的命中条目不会打断前缀缓存。
   let memory = MEMORY_HEADER;
   if (residentText) memory += `\n\n${residentText}`;
-  if (hitsBlock.text) memory += `\n\n【相关记忆】\n${hitsBlock.text}`;
-  memory += `\n\n${MEMORY_WRITE_GUIDE}\n\n${MEMORY_TAIL}`;
+  memory += `\n\n${MEMORY_WRITE_GUIDE}`;
+  const hitsText = hitsBlock.text ? `【相关记忆】\n${hitsBlock.text}` : '';
 
   return {
     persona,
     memory,
+    hitsText,
     debug: {
       enabled: true,
       persona_chars: persona.length,
@@ -1035,7 +1061,10 @@ async function handleChat(request, env, ctx, cors, json) {
     return json({ error: '数据库读写失败' }, 500);
   }
 
-  // 上下文顺序：persona → system prompt → 记忆消息（开关决定）→ 历史 → 新用户消息
+  // 上下文顺序（稳定前缀优先，便于上游做前缀缓存）：
+  // persona → system prompt → 回复方式 → 常驻记忆（身份/摘要/语气/pinned）
+  // → 历史 → 本轮命中记忆 + 角色指令 → 新用户消息
+  // 命中条目每轮都变，必须放在历史之后，不能插在常驻记忆里
   let mem;
   try {
     mem = await buildContext(env, st, content);
@@ -1043,13 +1072,33 @@ async function handleChat(request, env, ctx, cors, json) {
     console.log('memory load error', e.message);
     return json({ error: '记忆读取失败' }, 500);
   }
-  const systemPrompt = st.system_prompt || SYSTEM_PROMPT;
+  const systemPrompt = `${st.system_prompt || SYSTEM_PROMPT}\n\n${REPLY_STYLE}`;
   const messages = [
     { role: 'system', content: mem.persona ? `${mem.persona}\n\n${systemPrompt}` : systemPrompt },
   ];
   if (mem.memory) messages.push({ role: 'system', content: mem.memory });
-  messages.push(...history);
-  if (regenId === null) messages.push({ role: 'user', content });
+  // 尾部易变段：当前时间 + 命中条目 + 收尾指令，紧挨着本轮用户消息；记忆关闭时只留时间和指令
+  const volatile = [
+    nowNote(),
+    mem.hitsText,
+    mem.memory ? MEMORY_TAIL : '',
+  ].filter(Boolean).join('\n\n');
+  if (regenId === null) {
+    messages.push(...history);
+    if (volatile) messages.push({ role: 'system', content: volatile });
+    messages.push({ role: 'user', content });
+  } else {
+    // 重新生成：历史最后一条是触发它的用户消息，易变段插在它前面
+    const last = history[history.length - 1];
+    if (last && last.role === 'user') {
+      messages.push(...history.slice(0, -1));
+      if (volatile) messages.push({ role: 'system', content: volatile });
+      messages.push(last);
+    } else {
+      messages.push(...history);
+      if (volatile) messages.push({ role: 'system', content: volatile });
+    }
+  }
 
   // 2. 请求第三方接口（流式）
   const t0 = Date.now();
@@ -1175,6 +1224,18 @@ async function handleChat(request, env, ctx, cors, json) {
         // 记账在确认回复要保存之后执行；失败只记日志，不影响回复
         if (pinnedOps.length) await applyPinnedOps(env, pinnedOps);
 
+        // 前缀缓存观测：各上游字段名不同，取到哪个算哪个，都没有就明确标注
+        const numOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+        const cachedTokens =
+          numOrNull(usage?.prompt_tokens_details?.cached_tokens) ??
+          numOrNull(usage?.prompt_cache_hit_tokens) ??
+          numOrNull(usage?.cache_read_input_tokens);
+        const cache = {
+          prompt_tokens: usage?.prompt_tokens ?? null,
+          cached_tokens: cachedTokens,
+          cache_hit: cachedTokens === null ? null : cachedTokens > 0,
+          source: cachedTokens === null ? 'provider 未返回' : 'usage',
+        };
         const stats = {
           model: upstreamModel,
           first_token_ms: firstTokenMs,
@@ -1210,7 +1271,7 @@ async function handleChat(request, env, ctx, cors, json) {
           // 前端不改：把提示作为最后一段 delta 追加到界面，避免看起来像保存成功了
           await send('delta', { text: '\n\n（这条回复没有保存到数据库，刷新后会消失）' });
         }
-        await send('done', { id: savedId, ...stats });
+        await send('done', { id: savedId, ...stats, cache });
       } catch (e) {
         console.log('stream error', e.message);
         await send('error', { message: '生成中断' });
