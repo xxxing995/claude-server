@@ -627,7 +627,7 @@ async function handleApi(request, env, ctx, url) {
   m = path.match(/^\/api\/sessions\/(\d+)$/);
   if (m && request.method === 'DELETE') return deleteSession(env, m[1], json);
   if (path === '/api/pinned') {
-    if (request.method === 'GET') return listPinned(env, json);
+    if (request.method === 'GET') return listPinned(request, env, json);
     if (request.method === 'POST') return createPinned(request, env, json);
     if (request.method === 'PATCH') return updatePinnedStatus(request, env, json);
   }
@@ -702,6 +702,8 @@ async function handleRetract(request, env, json) {
 
 // ---- pinned：想要的方向。行级读写 memory_entries，不开放通用 settings 写入 ----
 const PINNED_CONTENT_MAX = 500;
+// 展示接口的硬上限，只防极端情况；默认返回全部
+const PINNED_LIST_HARD_MAX = 500;
 
 // pinned 的条数上限：settings.memory_pinned_limit 可覆盖，默认 10
 function pinnedLimitOf(settingsRow) {
@@ -723,17 +725,20 @@ function pinnedList(rows) {
     .sort((a, b) => (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
 }
 
-async function listPinned(env, json) {
+// 展示用：默认返回全部 pinned，不受 memory_pinned_limit（那条只给注入用）限制；
+// 可选 ?limit=N，仅作分页手段，硬上限 PINNED_LIST_HARD_MAX
+async function listPinned(request, env, json) {
+  const raw = new URL(request.url).searchParams.get('limit');
+  const n = Number(raw);
+  const limit = Number.isFinite(n) && n > 0 ? Math.min(PINNED_LIST_HARD_MAX, Math.floor(n)) : 0;
   try {
-    const [stRows, rows] = await Promise.all([
-      sb(env, 'GET', 'settings?session_id=eq.0&select=memory_pinned_limit&limit=1'),
-      sb(
-        env,
-        'GET',
-        'memory_entries?is_pinned=eq.true&select=id,content,status,priority,is_pinned,updated_at&order=updated_at.desc',
-      ),
-    ]);
-    return json({ limit: pinnedLimitOf(stRows?.[0]), entries: pinnedList(rows) });
+    const rows = await sb(
+      env,
+      'GET',
+      `memory_entries?is_pinned=eq.true&select=id,content,status,priority,is_pinned,updated_at&order=updated_at.desc&limit=${PINNED_LIST_HARD_MAX}`,
+    );
+    const all = pinnedList(rows);
+    return json({ total: all.length, entries: limit ? all.slice(0, limit) : all });
   } catch (e) {
     console.log('list pinned error', e.message);
     return json({ error: '读取想要的方向失败' }, 500);
