@@ -1,11 +1,10 @@
 const SYSTEM_PROMPT = '你是“我们的家”里温柔、简洁的陪伴助手，用中文回答一句话。';
 // 回复方式：不管 settings.system_prompt 怎么配，都追加这段（只改提示词，不改接口）
 const REPLY_STYLE = `【回复方式】
-- 像网聊一样说话：默认只回一到两句，口语、短句，说完就停，不要写成一大段文章。
 - 不要复述她刚说过的话，也不要复述记忆条目里的原话，直接接话。
-- 只回应她最后一条消息：不要补答更早的提问，也不要把几个话题合在一起答；前面没说完的，这一轮也不补。
-- 需要接着说的时候，用一个空行另起一条，每条各自独立成句；最多再起两三条，总量要克制。
-- 空行只用来分隔消息，不要拿空行做排版，也不要把一句话拆成一堆碎句。`;
+- 先接住她最后一条消息；更早的提问不要在这一轮补答，也不要把几个话题并成一段。
+- 需要接着说的时候，用一个空行另起一条，每条各自独立成句。
+- 空行只用来分隔消息，不要用空行做排版。`;
 
 // 当前现实时间：北京时间，放在易变尾部（历史之后、本轮用户消息之前），不参与前缀缓存
 function nowNote() {
@@ -20,7 +19,7 @@ function nowNote() {
     weekday: 'short',
   }).formatToParts(new Date());
   const g = (t) => parts.find((p) => p.type === t)?.value || '';
-  return `【现在】${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}（北京时间，${g('weekday')}）。这是系统提供的当前时间，不是她说的。`;
+  return `【现在】${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}（北京时间，${g('weekday')}）`;
 }
 
 async function safeEqual(a, b) {
@@ -303,12 +302,20 @@ const DEFAULT_SETTINGS = {
   max_context_messages: 6,
 };
 
-// 记忆注入的字符预算（不是 token；中文大约 1 字 ≈ 1~2 token），分两段各自裁剪：
+// 记忆注入的字符预算（不是 token；中文大约 1 字 ≈ 0.6~1 token），分两段各自裁剪：
 //   常驻段：身份锚点 + 事件摘要 + 语气样本 + pinned，上限 4200；
-//   命中段：关键词命中的普通条目，上限 3000。
+//   命中段：关键词命中的普通条目，按条数取（短 3 / 长 8），3000 字符只做兜底。
 // 两段互不挤占；persona 属于人格层，不计入这两段预算。
 const MEMORY_RESIDENT_MAX = 4200;
+// 命中段主规则是条数，字符上限只做兜底（按条数选完之后如果还超，再从尾部裁）
 const MEMORY_HITS_MAX = 3000;
+// 极短消息不注入命中段：去空白后 ≤10 字符，多是「嗯」「在吗」这类应答，命中基本是噪声
+const MEMORY_HITS_TINY_MAX = 10;
+// 长 / 短分界：≤40 字符按短消息给 3 条（一句话内的问法，3 条背景够接住）；
+// >40 字符按长消息给 8 条（通常含多个实词或一段叙述，需要更多背景才不至于答偏）
+const MEMORY_HITS_SHORT_MAX = 40;
+const MEMORY_HITS_COUNT_SHORT = 3;
+const MEMORY_HITS_COUNT_LONG = 8;
 // pinned 中已完成 / 已取消默认只取最近 10 条；可用 settings.memory_pinned_limit 覆盖
 const MEMORY_PINNED_LIMIT = 10;
 const PINNED_STATUSES = ['pending', 'agreed', 'done', 'cancelled'];
@@ -325,9 +332,10 @@ const MEMORY_WRITE_GUIDE = `【想要的方向 · 记账】
 - done（已完成）：约定的事确实已经发生并完成。只有「已经做完」才从约定改成已完成，只是聊到、计划中或答应过都不算。
 - cancelled（已取消）：明确放弃、反悔或约定失效。只是暂时没提、犹豫、没做到，都不算取消。
 需要新建或改状态时，在回复末尾追加指令，每条单独一行：
-<mem>{"op":"create","content":"一句话写清这件事","status":"pending"}</mem>
+<mem>{"op":"create","content":"她希望被允许不确定，而不是被要求给出结论","status":"pending"}</mem>
 <mem>{"op":"status","id":"上方方括号里的 id","status":"done"}</mem>
-规则：id 必须来自【想要的方向】每条开头的方括号；只在确实有变化时写，不要因为一句话就新建；没有变化就不要输出任何 <mem>；这些标记用户看不到，不要解释、复述或提及。`;
+create 的 content 必须是归纳后的一句话：用第三人称概括（「她…」），不超过 60 字，只保留事实与承诺的核心；禁止照抄她的原句，禁止带引号引用。
+规则：id 必须来自【想要的方向】每条开头的方括号；只在确实有变化时写，不要因为一句话就新建；没有变化就不要输出任何 <mem>；status 只改状态，不改 content；这些标记用户看不到，不要解释、复述或提及。`;
 // 历史消息的字符兜底：条数由 settings.max_context_messages 控制，超长时从更早的开始丢
 const HISTORY_MAX_CHARS = 6000;
 
@@ -343,6 +351,14 @@ function asArray(v) {
     }
   }
   return [];
+}
+
+// 命中段条数计划：极短不注入；短消息 3 条；长消息 8 条。字符上限只兜底
+function hitsPlan(text) {
+  const n = (text || '').trim().length;
+  if (n <= MEMORY_HITS_TINY_MAX) return { mode: 'skip', count: 0, textLen: n };
+  if (n <= MEMORY_HITS_SHORT_MAX) return { mode: 'short', count: MEMORY_HITS_COUNT_SHORT, textLen: n };
+  return { mode: 'long', count: MEMORY_HITS_COUNT_LONG, textLen: n };
 }
 
 // 关键词命中：用户消息原样、大小写不敏感、子串即算；priority 降序，同优先级保持原顺序
@@ -465,22 +481,23 @@ function buildPinnedBlock(pinned, budget) {
   };
 }
 
-// 命中段：priority 降序放，超出 3000 的条目跳过（让更多高优先级的小条目留下）
-function buildHitsBlock(hits, max) {
+// 命中段：先按条数取（短 3 / 长 8），再用字符上限兜底；priority 降序由 pickEntries 保证
+function buildHitsBlock(hits, count, max) {
+  const picked = hits.slice(0, Math.max(0, count));
   const lines = [];
   const kept = [];
   let used = 0;
-  for (const h of hits) {
+  for (const h of picked) {
     const content = typeof h.entry.content === 'string' ? h.entry.content.trim() : '';
     if (!content) continue;
     const line = `- ${content}`;
     const add = line.length + (lines.length ? 1 : 0);
-    if (used + add > max) continue;
+    if (used + add > max) continue; // 兜底：超字符上限的条目跳过，不再向后找补
     lines.push(line);
     kept.push(h);
     used += add;
   }
-  return { text: lines.join('\n'), used, kept };
+  return { text: lines.join('\n'), used, kept, capTrimmed: kept.length < picked.length };
 }
 
 // 从 memory_documents 取当前 active 版本；缺行、空内容、坏 JSON 都静默降级
@@ -538,6 +555,9 @@ async function buildContext(env, st, userText) {
         hits_chars: 0,
         hits_limit: MEMORY_HITS_MAX,
         hit_count: 0,
+        hits_mode: 'off',
+        hits_target: 0,
+        hits_cap_trimmed: false,
         pinned_count: 0,
         pinned_total: 0,
         pinned_truncated: false,
@@ -555,7 +575,8 @@ async function buildContext(env, st, userText) {
     .filter(Boolean)
     .join('\n');
   const pinned = pickPinned(entries, pinnedLimit);
-  const hits = pickEntries(entries.filter((e) => !isPinnedEntry(e)), userText);
+  const plan = hitsPlan(userText);
+  const hits = plan.count > 0 ? pickEntries(entries.filter((e) => !isPinnedEntry(e)), userText) : [];
 
   // 常驻段：身份锚点 > 摘要 > 语气样本 > pinned，超预算时按这个顺序让位
   const sections = [];
@@ -568,7 +589,7 @@ async function buildContext(env, st, userText) {
   const pinnedBudget = Math.max(0, MEMORY_RESIDENT_MAX - core.used - (core.text ? 2 : 0));
   const pinnedBlock = buildPinnedBlock(pinned, pinnedBudget);
   const residentText = [core.text, pinnedBlock.text].filter(Boolean).join('\n\n');
-  const hitsBlock = buildHitsBlock(hits, MEMORY_HITS_MAX);
+  const hitsBlock = buildHitsBlock(hits, plan.count, MEMORY_HITS_MAX);
 
   // 两段各自独立裁剪后再拼：常驻段（身份/摘要/语气/pinned）进稳定前缀，
   // 命中段挪出记忆消息，交给调用方放到历史之后、紧邻本轮用户消息的位置。
@@ -590,6 +611,9 @@ async function buildContext(env, st, userText) {
       hits_chars: hitsBlock.used,
       hits_limit: MEMORY_HITS_MAX,
       hit_count: hitsBlock.kept.length,
+      hits_mode: plan.mode,
+      hits_target: plan.count,
+      hits_cap_trimmed: hitsBlock.capTrimmed,
       pinned_count: pinnedBlock.count,
       pinned_total: pinnedBlock.total,
       pinned_truncated: pinnedBlock.truncated,
@@ -750,7 +774,15 @@ async function handleRetract(request, env, json) {
 }
 
 // ---- pinned：想要的方向。行级读写 memory_entries，不开放通用 settings 写入 ----
-const PINNED_CONTENT_MAX = 500;
+const PINNED_CONTENT_MAX = 60;
+// 超过上限就截断，并去掉截断处残留的标点/空白，避免出现「她希望被允许不确定，」这种半句
+function clipPinnedContent(v) {
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (!s) return '';
+  const cut = s.length > PINNED_CONTENT_MAX ? s.slice(0, PINNED_CONTENT_MAX) : s;
+  const trimmed = cut.replace(/[，,。、；;：:！!？?…"'“”‘’「」『』（）()【】\s]+$/u, '');
+  return trimmed || cut.trim();
+}
 // 展示接口的硬上限，只防极端情况；默认返回全部
 const PINNED_LIST_HARD_MAX = 500;
 
@@ -802,7 +834,7 @@ async function createPinned(request, env, json) {
   } catch {
     return json({ error: '请求格式不正确' }, 400);
   }
-  const content = typeof body.content === 'string' ? body.content.trim().slice(0, PINNED_CONTENT_MAX) : '';
+  const content = clipPinnedContent(body.content);
   if (!content) return json({ error: '内容不能为空' }, 400);
   const priority = Math.min(5, Math.max(1, Number(body.priority) || 3));
   const now = new Date().toISOString();
@@ -932,7 +964,7 @@ async function applyPinnedOps(env, ops) {
     for (const op of ops.slice(0, MEM_DIRECTIVE_MAX)) {
       if (!op || typeof op !== 'object') continue;
       if (op.op === 'create') {
-        const content = typeof op.content === 'string' ? op.content.trim().slice(0, PINNED_CONTENT_MAX) : '';
+        const content = clipPinnedContent(op.content);
         if (!content || activeContents.has(content)) continue;
         const status = typeof op.status === 'string' && op.status ? op.status : 'pending';
         if (!PINNED_STATUSES.includes(status)) continue;
