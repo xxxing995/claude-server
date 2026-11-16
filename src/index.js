@@ -730,7 +730,7 @@ async function listPinned(env, json) {
       sb(
         env,
         'GET',
-        'memory_entries?is_pinned=eq.true&select=id,content,status,priority,updated_at&order=updated_at.desc',
+        'memory_entries?is_pinned=eq.true&select=id,content,status,priority,is_pinned,updated_at&order=updated_at.desc',
       ),
     ]);
     return json({ limit: pinnedLimitOf(stRows?.[0]), entries: pinnedList(rows) });
