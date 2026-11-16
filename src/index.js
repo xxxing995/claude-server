@@ -121,6 +121,188 @@ async function listMessages(env, sessionId, json) {
   }
 }
 
+// ---- 缓存命中统计 ----
+// 单价来自用户实测账单（USD / 百万 token）：输入 5、输出 25。
+// 缓存读按输入价的 0.1x 计，缓存写按 1.25x 计，所以每命中 1 token 省 0.9 倍输入价，
+// 每写 1 token 多付 0.25 倍输入价。输出价当前不参与节省计算，只作为口径列出。
+const PRICE_INPUT_PER_M = 5;
+const PRICE_OUTPUT_PER_M = 25;
+const CACHE_READ_MULTIPLIER = 0.1;
+const CACHE_WRITE_MULTIPLIER = 1.25;
+// 间隔分档：判断前缀缓存是否因为超过 TTL 而失效的关键证据
+const CACHE_INTERVAL_BUCKETS = [
+  { bucket: 'lt_5m', label: '< 5 分钟', maxMs: 5 * 60 * 1000 },
+  { bucket: 'm5_30', label: '5–30 分钟', maxMs: 30 * 60 * 1000 },
+  { bucket: 'gt_30m', label: '> 30 分钟', maxMs: Infinity },
+];
+
+const round = (v, d) => (typeof v === 'number' && Number.isFinite(v) ? Number(v.toFixed(d)) : null);
+const dayOf = (iso) => {
+  const t = Date.parse(typeof iso === 'string' ? iso : '');
+  if (!Number.isFinite(t)) return null;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(t));
+  const g = (k) => parts.find((p) => p.type === k)?.value || '';
+  return `${g('year')}-${g('month')}-${g('day')}`;
+};
+
+// 分页读取所有 assistant 回复里与缓存相关的列（PostgREST 单次最多 1000 行）
+async function loadUsageRows(env, withCacheCols) {
+  const cols =
+    'id,session_id,created_at,prompt_tokens,completion_tokens' +
+    (withCacheCols ? ',cached_tokens,cache_write_tokens' : '');
+  const out = [];
+  for (let offset = 0; offset < 20000; offset += 1000) {
+    const rows = await sb(
+      env,
+      'GET',
+      `messages?role=eq.assistant&select=${cols}&order=id.asc&limit=1000&offset=${offset}`,
+    );
+    if (!rows?.length) break;
+    out.push(...rows);
+    if (rows.length < 1000) break;
+  }
+  return out;
+}
+
+// GET /api/cache-stats：缓存命中率统计。
+// 口径：只有拿到 usage（prompt_tokens 非空）的回复才算“有数据”；
+// cached_tokens 为 null 表示 provider 没返回该字段，既不算命中也不算 miss，不计入命中率分母。
+async function cacheStats(env, json) {
+  let columnsReady = true;
+  let rows;
+  try {
+    rows = await loadUsageRows(env, true);
+  } catch (e) {
+    // 迁移 SQL 还没执行时降级：不带缓存列再读一次，统计返回空而不是 500
+    if (!/cached_tokens|cache_write_tokens/i.test(e.message)) {
+      console.log('cache stats error', e.message);
+      return json({ error: '读取缓存统计失败' }, 500);
+    }
+    columnsReady = false;
+    try {
+      rows = await loadUsageRows(env, false);
+    } catch (e2) {
+      console.log('cache stats error', e2.message);
+      return json({ error: '读取缓存统计失败' }, 500);
+    }
+  }
+
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const bySessionLast = new Map();
+  const days = new Map();
+  const buckets = CACHE_INTERVAL_BUCKETS.map((b) => ({
+    bucket: b.bucket,
+    label: b.label,
+    replies_with_usage: 0,
+    replies_with_cache: 0,
+    hits: 0,
+    cached_tokens: 0,
+  }));
+  const total = {
+    total_replies: rows.length,
+    replies_with_usage: 0,
+    replies_with_cache: 0,
+    hits: 0,
+    cached_tokens: 0,
+    cache_write_tokens: 0,
+  };
+
+  for (const r of rows) {
+    const promptTokens = num(r.prompt_tokens);
+    const cached = num(r.cached_tokens);
+    const written = num(r.cache_write_tokens);
+    const ts = Date.parse(typeof r.created_at === 'string' ? r.created_at : '');
+
+    // 间隔：同会话内与上一条 assistant 回复的时间差（第一条没有参照，不进分档）
+    const prev = bySessionLast.get(r.session_id);
+    let bucket = null;
+    if (Number.isFinite(ts)) {
+      if (Number.isFinite(prev)) {
+        const gap = ts - prev;
+        bucket = buckets.find((b, i) => gap < CACHE_INTERVAL_BUCKETS[i].maxMs) || null;
+      }
+      bySessionLast.set(r.session_id, ts);
+    }
+
+    if (promptTokens !== null) total.replies_with_usage++;
+    if (cached !== null) {
+      total.replies_with_cache++;
+      total.cached_tokens += cached;
+      if (cached > 0) total.hits++;
+    }
+    if (written !== null) total.cache_write_tokens += written;
+
+    const day = dayOf(r.created_at);
+    if (day) {
+      if (!days.has(day)) {
+        days.set(day, {
+          date: day,
+          replies_with_usage: 0,
+          replies_with_cache: 0,
+          hits: 0,
+          cached_tokens: 0,
+        });
+      }
+      const d = days.get(day);
+      if (promptTokens !== null) d.replies_with_usage++;
+      if (cached !== null) {
+        d.replies_with_cache++;
+        d.cached_tokens += cached;
+        if (cached > 0) d.hits++;
+      }
+    }
+
+    if (bucket && cached !== null) {
+      bucket.replies_with_cache++;
+      bucket.cached_tokens += cached;
+      if (cached > 0) bucket.hits++;
+      if (promptTokens !== null) bucket.replies_with_usage++;
+    } else if (bucket && promptTokens !== null) {
+      bucket.replies_with_usage++;
+    }
+  }
+
+  const withRate = (o) => ({
+    ...o,
+    hit_rate: o.replies_with_cache ? round(o.hits / o.replies_with_cache, 4) : null,
+    avg_cached_tokens: o.replies_with_cache ? round(o.cached_tokens / o.replies_with_cache, 1) : null,
+  });
+
+  // 节省：命中省下的输入费 - 缓存写多付的部分；两者都只涉及输入侧
+  const savedUsd =
+    (total.cached_tokens * PRICE_INPUT_PER_M * (1 - CACHE_READ_MULTIPLIER) -
+      total.cache_write_tokens * PRICE_INPUT_PER_M * (CACHE_WRITE_MULTIPLIER - 1)) /
+    1e6;
+
+  return json({
+    columns_ready: columnsReady,
+    pricing: {
+      currency: 'USD',
+      unit: 'per 1M tokens',
+      input: PRICE_INPUT_PER_M,
+      output: PRICE_OUTPUT_PER_M,
+      cache_read_multiplier: CACHE_READ_MULTIPLIER,
+      cache_write_multiplier: CACHE_WRITE_MULTIPLIER,
+      note: '单价来自用户实测账单；输出价不参与缓存节省计算，仅列出口径',
+    },
+    overview: {
+      ...withRate(total),
+      misses: total.replies_with_cache - total.hits,
+      cache_write_tokens: total.cache_write_tokens,
+      estimated_saved_usd: round(savedUsd, 6),
+    },
+    by_day: [...days.values()]
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+      .map((d) => withRate(d)),
+    by_interval: buckets.map((b) => withRate(b)),
+  });
+}
+
 // 清理接口地址：必须 https，去掉结尾的 / 和 /v1
 function cleanBaseUrl(v) {
   const s = typeof v === 'string' ? v.trim().slice(0, 200).replace(/\/+$/, '').replace(/\/v1$/, '') : '';
@@ -662,6 +844,9 @@ async function handleApi(request, env, ctx, url) {
   }
   if (path === '/api/sessions' && request.method === 'GET') {
 	return listSessions(env, json);
+  }
+  if (path === '/api/cache-stats' && request.method === 'GET') {
+    return cacheStats(env, json);
   }
   let m = path.match(/^\/api\/sessions\/(\d+)\/messages$/);
   if (m && request.method === 'GET') {
@@ -1265,9 +1450,15 @@ async function handleChat(request, env, ctx, cors, json) {
           numOrNull(usage?.prompt_tokens_details?.cached_tokens) ??
           numOrNull(usage?.prompt_cache_hit_tokens) ??
           numOrNull(usage?.cache_read_input_tokens);
+        // 缓存写入：Anthropic 用 cache_creation_input_tokens，部分兼容接口用 prompt_cache_write_tokens
+        const cacheWriteTokens =
+          numOrNull(usage?.prompt_tokens_details?.cache_write_tokens) ??
+          numOrNull(usage?.prompt_cache_write_tokens) ??
+          numOrNull(usage?.cache_creation_input_tokens);
         const cache = {
           prompt_tokens: usage?.prompt_tokens ?? null,
           cached_tokens: cachedTokens,
+          cache_write_tokens: cacheWriteTokens,
           cache_hit: cachedTokens === null ? null : cachedTokens > 0,
           source: cachedTokens === null ? 'provider 未返回' : 'usage',
         };
@@ -1278,19 +1469,30 @@ async function handleChat(request, env, ctx, cors, json) {
           prompt_tokens: usage?.prompt_tokens ?? null,
           completion_tokens: usage?.completion_tokens ?? null,
           total_tokens: usage?.total_tokens ?? null,
+          cached_tokens: cachedTokens,
+          cache_write_tokens: cacheWriteTokens,
           finish_reason: finish,
         };
         let savedId = null;
         let saveFailed = false;
         if (text || reasoning) {
           try {
-            const saved = await sb(env, 'POST', 'messages', {
+            const row = {
               session_id: sessionId,
               role: 'assistant',
               content: text,
               reasoning_content: reasoning || null,
               ...stats,
-            });
+            };
+            let saved;
+            try {
+              saved = await sb(env, 'POST', 'messages', row);
+            } catch (e) {
+              // 加列的迁移 SQL 还没执行时降级：去掉缓存列再写一次，不让回复保存失败
+              if (!/cached_tokens|cache_write_tokens/i.test(e.message)) throw e;
+              const { cached_tokens, cache_write_tokens, ...rest } = row;
+              saved = await sb(env, 'POST', 'messages', rest);
+            }
             savedId = saved?.[0]?.id ?? null;
             if (savedId === null) saveFailed = true;
             // 重新生成：新回复保存成功后，才删除旧回复（失败时旧回复不会丢）
