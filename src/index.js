@@ -625,6 +625,7 @@ async function handleApi(request, env, ctx, url) {
 	}
   }
   m = path.match(/^\/api\/sessions\/(\d+)$/);
+  if (m && request.method === 'PATCH') return renameSession(request, env, m[1], json);
   if (m && request.method === 'DELETE') return deleteSession(env, m[1], json);
   if (path === '/api/pinned') {
     if (request.method === 'GET') return listPinned(request, env, json);
@@ -670,6 +671,28 @@ async function deleteSession(env, id, json) {
     return json({ error: '数据库删除失败' }, 500);
   }
   return removeRow(env, 'sessions', id, json);
+}
+
+// 重命名会话：只改 sessions.name，updated_at 交给库里的 set_updated_at 触发器刷新
+async function renameSession(request, env, id, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: '请求格式不正确' }, 400);
+  }
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name) return json({ error: '会话名不能为空' }, 400);
+  if (name.length > 200) return json({ error: '会话名最多 200 个字符' }, 400);
+  try {
+    const rows = await sb(env, 'PATCH', `sessions?id=eq.${id}`, { name });
+    const row = rows && rows[0];
+    if (!row) return json({ error: '没有找到这个会话' }, 404);
+    return json({ id: row.id, name: row.name, updated_at: row.updated_at });
+  } catch (e) {
+    console.log('rename session error', e.message);
+    return json({ error: '重命名会话失败' }, 500);
+  }
 }
 
 // 撤回一轮：删掉这条用户消息，以及它之后的所有消息（即它的回复）；会话空了就一并删掉
