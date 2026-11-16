@@ -537,6 +537,38 @@ function asArray(v) {
   return [];
 }
 
+// 语气样本：兼容两种形态
+//   1. 字符串数组：按原样逐行渲染（旧格式，保持完全一致）
+//   2. 对象数组：{ scene, lines } 渲染成「【情境】」标签 + 各行原文，让模型看出这些话在什么场合说
+// 坏数据（解析失败、字段缺失、全为空）静默跳过，不抛错
+const TONE_SCENE_MAX = 20;
+function renderTone(raw) {
+  const out = [];
+  for (const item of asArray(raw)) {
+    if (typeof item === 'string') {
+      const t = item.trim();
+      if (t) out.push(t);
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const lines = Array.isArray(item.lines)
+      ? item.lines
+      : typeof item.text === 'string'
+        ? [item.text]
+        : [];
+    const kept = lines
+      .filter((x) => typeof x === 'string')
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (!kept.length) continue;
+    const scene =
+      typeof item.scene === 'string' ? item.scene.trim().slice(0, TONE_SCENE_MAX) : '';
+    if (scene) out.push(`【${scene}】`);
+    out.push(...kept);
+  }
+  return out.join('\n');
+}
+
 // 命中段条数计划：极短不注入；短消息 3 条；长消息 8 条。字符上限只兜底
 function hitsPlan(text) {
   const n = (text || '').trim().length;
@@ -754,10 +786,7 @@ async function buildContext(env, st, userText) {
 
   const identity = str(docs.identity);
   const digest = str(docs.digest);
-  const toneText = asArray(docs.tone)
-    .map((x) => (x && typeof x.text === 'string' ? x.text.trim() : ''))
-    .filter(Boolean)
-    .join('\n');
+  const toneText = renderTone(docs.tone);
   const pinned = pickPinned(entries, pinnedLimit);
   const plan = hitsPlan(userText);
   const hits = plan.count > 0 ? pickEntries(entries.filter((e) => !isPinnedEntry(e)), userText) : [];
