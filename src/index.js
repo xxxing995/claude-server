@@ -264,7 +264,317 @@ async function saveProvider(request, env, json, id) {
 }
 
 
-const DEFAULT_SETTINGS = { temperature: 0.7, max_context_rounds: 20, max_reply_tokens: 2000 };
+const DEFAULT_SETTINGS = {
+  temperature: 0.7,
+  max_context_rounds: 20,
+  max_reply_tokens: 2000,
+  // 记忆默认关闭；SQL 还没执行时这些列不存在，走这里的默认值，行为与旧版一致
+  memory_enabled: false,
+  memory_identity: '',
+  memory_digest: '',
+  // pinned 注入条数上限（约定 / 未决合计取最近 N 条）；不建列时用这个默认值
+  memory_pinned_limit: 10,
+  // 人格层默认空；没执行 SQL 时不会读到这一列
+  persona: '',
+  // 历史条数默认 6；自定义需要执行 alter table 加 max_context_messages
+  max_context_messages: 6,
+};
+
+// 记忆注入的字符预算（不是 token；中文大约 1 字 ≈ 1~2 token），分两段各自裁剪：
+//   常驻段：身份锚点 + 事件摘要 + 语气样本 + pinned，上限 4200；
+//   命中段：关键词命中的普通条目，上限 3000。
+// 两段互不挤占；persona 属于人格层，不计入这两段预算。
+const MEMORY_RESIDENT_MAX = 4200;
+const MEMORY_HITS_MAX = 3000;
+// pinned 中已完成 / 已取消默认只取最近 10 条；可用 settings.memory_pinned_limit 覆盖
+const MEMORY_PINNED_LIMIT = 10;
+const PINNED_STATUSES = ['pending', 'agreed', 'done', 'cancelled'];
+const PINNED_STATUS_LABEL = { pending: '未决', agreed: '约定', done: '已完成', cancelled: '已取消' };
+const MEMORY_HEADER =
+  '以下是你和她之间真实发生过的事，属于你自己的经历，用来保持连续，不需要逐条复述。它们不是这一轮要回答的问题，也不要因为看到了就主动提起。';
+// 记忆消息的最后一行：贴住历史与本轮消息，避免指令离得太远
+const MEMORY_TAIL = '直接以他的身份和口吻回应，不要跳出角色解释自己是谁。';
+// 记账指令说明：不进两段预算，只在记忆开启时随记忆消息一起注入
+const MEMORY_WRITE_GUIDE = `【想要的方向 · 记账】
+你可以自己维护「想要的方向」，共四种状态：
+- pending（未决）：提过、动过念头，但还没说定。
+- agreed（约定）：双方明确同意，要一起做或一直遵守。
+- done（已完成）：约定的事确实已经发生并完成。只有「已经做完」才从约定改成已完成，只是聊到、计划中或答应过都不算。
+- cancelled（已取消）：明确放弃、反悔或约定失效。只是暂时没提、犹豫、没做到，都不算取消。
+需要新建或改状态时，在回复末尾追加指令，每条单独一行：
+<mem>{"op":"create","content":"一句话写清这件事","status":"pending"}</mem>
+<mem>{"op":"status","id":"上方方括号里的 id","status":"done"}</mem>
+规则：id 必须来自【想要的方向】每条开头的方括号；只在确实有变化时写，不要因为一句话就新建；没有变化就不要输出任何 <mem>；这些标记用户看不到，不要解释、复述或提及。`;
+// 历史消息的字符兜底：条数由 settings.max_context_messages 控制，超长时从更早的开始丢
+const HISTORY_MAX_CHARS = 6000;
+
+// 把 jsonb 字段安全地当数组用；类型不对或 JSON 坏了都当空数组
+function asArray(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') {
+    try {
+      const a = JSON.parse(v);
+      return Array.isArray(a) ? a : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+// 关键词命中：用户消息原样、大小写不敏感、子串即算；priority 降序，同优先级保持原顺序
+function pickEntries(entries, text) {
+  const lower = (text || '').toLowerCase();
+  const out = [];
+  entries.forEach((e, i) => {
+    if (!e || typeof e.content !== 'string' || !e.content.trim()) return;
+    const kws = Array.isArray(e.keywords) ? e.keywords : [];
+    const hit = kws.some((k) => typeof k === 'string' && k.length > 0 && lower.includes(k.toLowerCase()));
+    if (hit) out.push({ entry: e, index: i });
+  });
+  out.sort((a, b) => (Number(b.entry.priority) || 0) - (Number(a.entry.priority) || 0) || a.index - b.index);
+  return out;
+}
+
+// pinned 的识别：新表以 is_pinned 为准；兼容旧结构里的 pinned=true 或仅有 status 的条目。
+// 布尔标记明确为 false 时直接判为非 pinned，避免把普通条目的 status 误当成 pinned。
+function isPinnedEntry(e) {
+  if (!e || typeof e !== 'object') return false;
+  if (e.pinned === true || e.is_pinned === true) return true;
+  if (e.pinned === false || e.is_pinned === false) return false;
+  return typeof e.status === 'string' && e.status.trim().length > 0;
+}
+
+// pinned 的稳定标识：新表用数值 id；兼容旧数据的字符串 id / key；都没有时用数组下标兜底
+function pinnedKey(e, i) {
+  if (typeof e.id === 'number' && Number.isFinite(e.id)) return String(e.id);
+  if (typeof e.id === 'string' && e.id.trim()) return e.id.trim();
+  if (typeof e.key === 'string' && e.key.trim()) return e.key.trim();
+  return `pinned-${i}`;
+}
+
+function pinnedStatus(e) {
+  return PINNED_STATUSES.includes(e?.status) ? e.status : 'pending';
+}
+
+function pinnedTime(e) {
+  const t = Date.parse(typeof e?.updated_at === 'string' ? e.updated_at : '');
+  return Number.isFinite(t) ? t : 0;
+}
+
+// 常驻注入用的 pinned：
+//   pending / agreed 全量注入，不受 N 约束；
+//   done / cancelled 按 updated_at 倒序只取最近 N 条（N = memory_pinned_limit）。
+// 两类合并后再统一按 updated_at 倒序，不按状态分组，顺序与 We 页一致。
+function pickPinned(entries, limit) {
+  const all = entries
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => isPinnedEntry(entry));
+  const byTime = (a, b) => pinnedTime(b.entry) - pinnedTime(a.entry) || b.index - a.index;
+  const active = all.filter(({ entry }) => {
+    const status = pinnedStatus(entry);
+    return status === 'pending' || status === 'agreed';
+  });
+  const finished = all
+    .filter(({ entry }) => {
+      const status = pinnedStatus(entry);
+      return status === 'done' || status === 'cancelled';
+    })
+    .sort(byTime)
+    .slice(0, limit);
+  return [...active, ...finished].sort(byTime);
+}
+
+// 按 weight 降序贪心保留整段；都放不下时只截断优先级最高的一段
+function fitSections(sections, max) {
+  const ordered = [...sections].sort((a, b) => b.weight - a.weight || a.index - b.index);
+  const chosen = new Map();
+  let used = 0;
+  for (const s of ordered) {
+    const add = s.text.length + (chosen.size ? 2 : 0);
+    if (used + add <= max) {
+      chosen.set(s.index, s.text);
+      used += add;
+    }
+  }
+  if (!chosen.size && ordered.length) {
+    const top = ordered[0];
+    const text = top.text.slice(0, max);
+    if (text) {
+      chosen.set(top.index, text);
+      used = text.length;
+    }
+  }
+  const kept = sections.filter((s) => chosen.has(s.index)).map((s) => chosen.get(s.index));
+  return { text: kept.join('\n\n'), used, keptIndexes: new Set(chosen.keys()) };
+}
+
+// pinned 块：注入顺序与 We 页一致（updated_at 倒序），不按状态分组；
+// 超出预算时保留最近的一段（时间倒序截断），锚点 / 摘要 / 语气已经先占位。
+function buildPinnedBlock(pinned, budget) {
+  if (!pinned.length || budget <= 0) {
+    return { text: '', used: 0, count: 0, total: pinned.length, truncated: pinned.length > 0 };
+  }
+  const header = '【想要的方向】';
+  const display = [...pinned].sort(
+    (a, b) => pinnedTime(b.entry) - pinnedTime(a.entry) || b.index - a.index,
+  );
+  const lines = [];
+  let used = header.length;
+  for (const { entry, index } of display) {
+    const content = typeof entry.content === 'string' ? entry.content.trim() : '';
+    if (!content) continue;
+    const line = `- [${pinnedKey(entry, index)}]（${PINNED_STATUS_LABEL[pinnedStatus(entry)]}）${content}`;
+    const add = line.length + 1;
+    if (used + add > budget) break; // 保留最近的连续一段，更早的让出去
+    lines.push(line);
+    used += add;
+  }
+  if (!lines.length) {
+    return { text: '', used: 0, count: 0, total: pinned.length, truncated: true };
+  }
+  return {
+    text: `${header}\n${lines.join('\n')}`,
+    used: used - 1,
+    count: lines.length,
+    total: pinned.length,
+    truncated: lines.length < pinned.length,
+  };
+}
+
+// 命中段：priority 降序放，超出 3000 的条目跳过（让更多高优先级的小条目留下）
+function buildHitsBlock(hits, max) {
+  const lines = [];
+  const kept = [];
+  let used = 0;
+  for (const h of hits) {
+    const content = typeof h.entry.content === 'string' ? h.entry.content.trim() : '';
+    if (!content) continue;
+    const line = `- ${content}`;
+    const add = line.length + (lines.length ? 1 : 0);
+    if (used + add > max) continue;
+    lines.push(line);
+    kept.push(h);
+    used += add;
+  }
+  return { text: lines.join('\n'), used, kept };
+}
+
+// 从 memory_documents 取当前 active 版本；缺行、空内容、坏 JSON 都静默降级
+async function loadMemoryDocs(env) {
+  const rows = await sb(env, 'GET', 'memory_documents?select=kind,content&is_active=eq.true');
+  const docs = {};
+  for (const r of rows || []) {
+    if (r && typeof r.kind === 'string' && typeof r.content === 'string') docs[r.kind] = r.content;
+  }
+  return docs;
+}
+
+// 从 memory_entries 取条目；keywords 统一成数组，is_pinned 映射成 pinned 供现有注入逻辑复用
+async function loadMemoryEntries(env) {
+  const rows = await sb(
+    env,
+    'GET',
+    'memory_entries?select=id,content,keywords,priority,status,is_pinned,updated_at&order=updated_at.desc',
+  );
+  return (rows || [])
+    .filter((r) => r && typeof r.content === 'string')
+    .map((r) => ({
+      ...r,
+      keywords: Array.isArray(r.keywords) ? r.keywords : [],
+      priority: Number(r.priority) || 0,
+      pinned: r.is_pinned === true,
+      status: PINNED_STATUSES.includes(r.status) ? r.status : 'pending',
+    }));
+}
+
+// 组装人格层与记忆消息。只读，不抛错：字段缺失、类型不对、JSON 解析失败都静默降级。
+// memory_enabled 只管记忆；persona 是人格层，不受这个开关控制（见 docs/backend.md）。
+async function buildContext(env, st, userText) {
+  const enabled = st.memory_enabled === true;
+  const [docs, entries] = await Promise.all([
+    loadMemoryDocs(env),
+    enabled ? loadMemoryEntries(env) : Promise.resolve([]),
+  ]);
+  const str = (v) => (typeof v === 'string' ? v.trim() : '');
+  const persona = str(docs.persona);
+  const pinnedLimit = Math.min(
+    50,
+    Math.max(1, Number(st.memory_pinned_limit) || MEMORY_PINNED_LIMIT),
+  );
+  if (!enabled) {
+    return {
+      persona,
+      memory: null,
+      debug: {
+        enabled: false,
+        persona_chars: persona.length,
+        resident_chars: 0,
+        resident_limit: MEMORY_RESIDENT_MAX,
+        hits_chars: 0,
+        hits_limit: MEMORY_HITS_MAX,
+        hit_count: 0,
+        pinned_count: 0,
+        pinned_total: 0,
+        pinned_truncated: false,
+        tone_chars: 0,
+        entries_chars: 0,
+        hits: [],
+      },
+    };
+  }
+
+  const identity = str(docs.identity);
+  const digest = str(docs.digest);
+  const toneText = asArray(docs.tone)
+    .map((x) => (x && typeof x.text === 'string' ? x.text.trim() : ''))
+    .filter(Boolean)
+    .join('\n');
+  const pinned = pickPinned(entries, pinnedLimit);
+  const hits = pickEntries(entries.filter((e) => !isPinnedEntry(e)), userText);
+
+  // 常驻段：身份锚点 > 摘要 > 语气样本 > pinned，超预算时按这个顺序让位
+  const sections = [];
+  if (identity) sections.push({ index: 0, text: `【身份锚点】\n${identity}`, weight: 400 });
+  if (digest) sections.push({ index: 1, text: `【事件摘要】\n${digest}`, weight: 300 });
+  if (toneText) {
+    sections.push({ index: 2, text: `以下是你说过的话，是你的说话方式：\n${toneText}`, weight: 200 });
+  }
+  const core = fitSections(sections, MEMORY_RESIDENT_MAX);
+  const pinnedBudget = Math.max(0, MEMORY_RESIDENT_MAX - core.used - (core.text ? 2 : 0));
+  const pinnedBlock = buildPinnedBlock(pinned, pinnedBudget);
+  const residentText = [core.text, pinnedBlock.text].filter(Boolean).join('\n\n');
+  const hitsBlock = buildHitsBlock(hits, MEMORY_HITS_MAX);
+
+  // 两段各自独立裁剪后再拼成一条记忆消息，命中段不会挤掉常驻段；
+  // 记账说明不计入两段预算，记忆开启时始终附带，保证模型有写入通道。
+  let memory = MEMORY_HEADER;
+  if (residentText) memory += `\n\n${residentText}`;
+  if (hitsBlock.text) memory += `\n\n【相关记忆】\n${hitsBlock.text}`;
+  memory += `\n\n${MEMORY_WRITE_GUIDE}\n\n${MEMORY_TAIL}`;
+
+  return {
+    persona,
+    memory,
+    debug: {
+      enabled: true,
+      persona_chars: persona.length,
+      resident_chars: residentText.length,
+      resident_limit: MEMORY_RESIDENT_MAX,
+      hits_chars: hitsBlock.used,
+      hits_limit: MEMORY_HITS_MAX,
+      hit_count: hitsBlock.kept.length,
+      pinned_count: pinnedBlock.count,
+      pinned_total: pinnedBlock.total,
+      pinned_truncated: pinnedBlock.truncated,
+      tone_chars: core.keptIndexes.has(2) ? toneText.length : 0,
+      entries_chars: hitsBlock.used, // 兼容旧字段名
+      hits: hitsBlock.kept
+        .map((h) => (h.entry.id != null ? String(h.entry.id) : ''))
+        .filter(Boolean),
+    },
+  };
+}
 
 // 入口：跨域 + 访问口令 + 路由
 async function handleApi(request, env, ctx, url) {
@@ -316,6 +626,11 @@ async function handleApi(request, env, ctx, url) {
   }
   m = path.match(/^\/api\/sessions\/(\d+)$/);
   if (m && request.method === 'DELETE') return deleteSession(env, m[1], json);
+  if (path === '/api/pinned') {
+    if (request.method === 'GET') return listPinned(env, json);
+    if (request.method === 'POST') return createPinned(request, env, json);
+    if (request.method === 'PATCH') return updatePinnedStatus(request, env, json);
+  }
 	if (path === '/api/providers') {
 	if (request.method === 'GET') return listProviders(env, json);
 	if (request.method === 'POST') return saveProvider(request, env, json, null);
@@ -382,6 +697,216 @@ async function handleRetract(request, env, json) {
   } catch (e) {
     console.log('retract error', e.message);
     return json({ error: '数据库撤回失败' }, 500);
+  }
+}
+
+// ---- pinned：想要的方向。行级读写 memory_entries，不开放通用 settings 写入 ----
+const PINNED_CONTENT_MAX = 500;
+
+// pinned 的条数上限：settings.memory_pinned_limit 可覆盖，默认 10
+function pinnedLimitOf(settingsRow) {
+  return Math.min(50, Math.max(1, Number(settingsRow?.memory_pinned_limit) || MEMORY_PINNED_LIMIT));
+}
+
+// 对外展示用的 pinned：包含四种状态，按最近更新倒序
+function pinnedList(rows) {
+  return (rows || [])
+    .filter((r) => r && r.is_pinned === true)
+    .map((r) => ({
+      id: r.id == null ? '' : String(r.id),
+      content: typeof r.content === 'string' ? r.content.trim() : '',
+      status: pinnedStatus(r),
+      priority: Number(r.priority) || 0,
+      updated_at: typeof r.updated_at === 'string' ? r.updated_at : null,
+    }))
+    .filter((x) => x.id && x.content)
+    .sort((a, b) => (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
+}
+
+async function listPinned(env, json) {
+  try {
+    const [stRows, rows] = await Promise.all([
+      sb(env, 'GET', 'settings?session_id=eq.0&select=memory_pinned_limit&limit=1'),
+      sb(
+        env,
+        'GET',
+        'memory_entries?is_pinned=eq.true&select=id,content,status,priority,updated_at&order=updated_at.desc',
+      ),
+    ]);
+    return json({ limit: pinnedLimitOf(stRows?.[0]), entries: pinnedList(rows) });
+  } catch (e) {
+    console.log('list pinned error', e.message);
+    return json({ error: '读取想要的方向失败' }, 500);
+  }
+}
+
+// 新增一条 pinned：只有 content 由前端提供，状态固定从 pending 开始
+async function createPinned(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: '请求格式不正确' }, 400);
+  }
+  const content = typeof body.content === 'string' ? body.content.trim().slice(0, PINNED_CONTENT_MAX) : '';
+  if (!content) return json({ error: '内容不能为空' }, 400);
+  const priority = Math.min(5, Math.max(1, Number(body.priority) || 3));
+  const now = new Date().toISOString();
+  try {
+    const rows = await sb(env, 'POST', 'memory_entries', {
+      content,
+      keywords: [],
+      priority,
+      status: 'pending',
+      is_pinned: true,
+      is_summary: false,
+      source: 'user',
+      created_at: now,
+      updated_at: now,
+    });
+    return json({ ok: true, entry: pinnedList(rows)[0] || null });
+  } catch (e) {
+    console.log('create pinned error', e.message);
+    return json({ error: '保存想要的方向失败' }, 500);
+  }
+}
+
+// 只改状态：id 是 memory_entries.id；不允许改内容
+async function updatePinnedStatus(request, env, json) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: '请求格式不正确' }, 400);
+  }
+  const idNum = Number(body.id);
+  const status = typeof body.status === 'string' ? body.status : '';
+  if (!Number.isInteger(idNum) || idNum <= 0) return json({ error: '缺少 pinned id' }, 400);
+  if (!PINNED_STATUSES.includes(status)) {
+    return json({ error: '状态只能是 pending / agreed / done / cancelled' }, 400);
+  }
+  try {
+    const rows = await sb(env, 'PATCH', `memory_entries?id=eq.${idNum}&is_pinned=eq.true`, {
+      status,
+      updated_at: new Date().toISOString(),
+    });
+    if (!rows?.length) return json({ error: '没有找到这条 pinned' }, 404);
+    return json({ ok: true, entry: pinnedList(rows)[0] || null });
+  } catch (e) {
+    console.log('update pinned error', e.message);
+    return json({ error: '更新想要的方向失败' }, 500);
+  }
+}
+
+// ---- 模型记账：回复里的 <mem>{...}</mem> 指令，流式摘除、静默解析 ----
+const MEM_DIRECTIVE_OPEN = '<mem>';
+const MEM_DIRECTIVE_CLOSE = '</mem>';
+const MEM_DIRECTIVE_MAX = 10;
+
+// buf 末尾有多少个字符是 marker 的前缀：分片可能把 "<mem" 切成 "<me"，这些先扣住不输出
+function partialPrefixLen(buf, marker) {
+  const max = Math.min(buf.length, marker.length - 1);
+  for (let n = max; n > 0; n--) {
+    if (buf.endsWith(marker.slice(0, n))) return n;
+  }
+  return 0;
+}
+
+// 流式过滤器：push 返回可以安全展示的文本；完整指令交给 onDirective 后丢弃；
+// 流结束时未闭合的指令整段丢弃（解析失败静默，不影响正常回复）。
+function createDirectiveFilter(onDirective) {
+  let buf = '';
+  let collecting = false;
+  return {
+    push(chunk) {
+      let out = '';
+      buf += chunk;
+      while (buf) {
+        if (!collecting) {
+          const i = buf.indexOf(MEM_DIRECTIVE_OPEN);
+          if (i === -1) {
+            const hold = partialPrefixLen(buf, MEM_DIRECTIVE_OPEN);
+            out += buf.slice(0, buf.length - hold);
+            buf = buf.slice(buf.length - hold);
+            break;
+          }
+          out += buf.slice(0, i);
+          buf = buf.slice(i + MEM_DIRECTIVE_OPEN.length);
+          collecting = true;
+          continue;
+        }
+        const j = buf.indexOf(MEM_DIRECTIVE_CLOSE);
+        if (j === -1) break; // 等下一片
+        const raw = buf.slice(0, j);
+        buf = buf.slice(j + MEM_DIRECTIVE_CLOSE.length);
+        collecting = false;
+        try {
+          onDirective(JSON.parse(raw));
+        } catch {
+          // 指令坏了就丢掉，不影响正文
+        }
+      }
+      return out;
+    },
+    end() {
+      if (collecting) {
+        buf = '';
+        return '';
+      }
+      const rest = buf;
+      buf = '';
+      return rest;
+    },
+  };
+}
+
+// 把指令逐条落到 memory_entries：create 单行插入，status 单行更新；失败只记日志
+async function applyPinnedOps(env, ops) {
+  if (!ops.length) return;
+  try {
+    // 只查未决 / 约定的内容用于去重，避免同一件事重复建
+    const active = await sb(
+      env,
+      'GET',
+      'memory_entries?is_pinned=eq.true&status=in.(pending,agreed)&select=content',
+    );
+    const activeContents = new Set(
+      (active || [])
+        .map((r) => (typeof r.content === 'string' ? r.content.trim() : ''))
+        .filter(Boolean),
+    );
+    for (const op of ops.slice(0, MEM_DIRECTIVE_MAX)) {
+      if (!op || typeof op !== 'object') continue;
+      if (op.op === 'create') {
+        const content = typeof op.content === 'string' ? op.content.trim().slice(0, PINNED_CONTENT_MAX) : '';
+        if (!content || activeContents.has(content)) continue;
+        const status = typeof op.status === 'string' && op.status ? op.status : 'pending';
+        if (!PINNED_STATUSES.includes(status)) continue;
+        const now = new Date().toISOString();
+        await sb(env, 'POST', 'memory_entries', {
+          content,
+          keywords: [],
+          priority: 3,
+          status,
+          is_pinned: true,
+          is_summary: false,
+          source: 'model',
+          created_at: now,
+          updated_at: now,
+        });
+        activeContents.add(content);
+      } else if (op.op === 'status') {
+        const idNum = Number(op.id);
+        const status = typeof op.status === 'string' ? op.status : '';
+        if (!Number.isInteger(idNum) || idNum <= 0 || !PINNED_STATUSES.includes(status)) continue;
+        await sb(env, 'PATCH', `memory_entries?id=eq.${idNum}&is_pinned=eq.true`, {
+          status,
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+  } catch (e) {
+    console.log('apply pinned ops error', e.message);
   }
 }
 
@@ -452,18 +977,51 @@ async function handleChat(request, env, ctx, cors, json) {
       userMessageId = u[0].id;
     }
 
-    const rounds = Math.max(1, Number(st.max_context_rounds) || 20);
-    const before = regenId !== null ? `&id=lt.${regenId}` : ''; // 重新生成时，历史不包含旧回复
+    // 历史按“最近 N 条消息”取，不再按轮数乘二；缺列或为空时默认 6
+    const maxMessages = Math.max(1, Number(st.max_context_messages) || 6);
+    // 历史要排除"刚刚插入的这条用户消息"，否则它会占掉一个名额；
+    // 组装上下文时再把它作为最后一条补回去。重新生成时排除的是旧回复。
+    const before =
+      regenId !== null ? `&id=lt.${regenId}` : userMessageId !== null ? `&id=lt.${userMessageId}` : '';
     const recent = await sb(
       env,
       'GET',
-      `messages?session_id=eq.${sessionId}&visible=eq.true&role=in.(user,assistant)${before}&select=role,content&order=id.desc&limit=${rounds * 2}`,
+      `messages?session_id=eq.${sessionId}&visible=eq.true&role=in.(user,assistant)${before}&select=role,content&order=id.desc&limit=${maxMessages}`,
     );
-    history = recent.reverse();
+    // 字符上限兜底：从最新往回保留，超过 HISTORY_MAX_CHARS 就丢掉更早的
+    const kept = [];
+    let used = 0;
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const len = typeof recent[i].content === 'string' ? recent[i].content.length : 0;
+      if (kept.length > 0 && used + len > HISTORY_MAX_CHARS) break;
+      kept.push(recent[i]);
+      used += len;
+    }
+    history = kept.reverse();
+    // 单条就超上限时，至少保留这一条，但把它裁到上限，避免把请求撑爆
+    if (history.length === 1 && typeof history[0].content === 'string' && history[0].content.length > HISTORY_MAX_CHARS) {
+      history[0] = { ...history[0], content: history[0].content.slice(0, HISTORY_MAX_CHARS) };
+    }
   } catch (e) {
     console.log('db error', e.message);
     return json({ error: '数据库读写失败' }, 500);
   }
+
+  // 上下文顺序：persona → system prompt → 记忆消息（开关决定）→ 历史 → 新用户消息
+  let mem;
+  try {
+    mem = await buildContext(env, st, content);
+  } catch (e) {
+    console.log('memory load error', e.message);
+    return json({ error: '记忆读取失败' }, 500);
+  }
+  const systemPrompt = st.system_prompt || SYSTEM_PROMPT;
+  const messages = [
+    { role: 'system', content: mem.persona ? `${mem.persona}\n\n${systemPrompt}` : systemPrompt },
+  ];
+  if (mem.memory) messages.push({ role: 'system', content: mem.memory });
+  messages.push(...history);
+  if (regenId === null) messages.push({ role: 'user', content });
 
   // 2. 请求第三方接口（流式）
   const t0 = Date.now();
@@ -478,7 +1036,7 @@ async function handleChat(request, env, ctx, cors, json) {
         stream_options: { include_usage: true },
         temperature: Number(st.temperature),
         max_tokens: Number(st.max_reply_tokens),
-        messages: [{ role: 'system', content: st.system_prompt || SYSTEM_PROMPT }, ...history],
+        messages,
       }),
     });
   } catch {
@@ -510,8 +1068,17 @@ async function handleChat(request, env, ctx, cors, json) {
       let firstTokenMs = null;
       let usage = null;
       let finish = null;
+      // 每条记账指令先收集，等回复正常结束、确认要保存后再落到数据库
+      const pinnedOps = [];
+      const collectOp = (d) => {
+        if (d && typeof d === 'object') pinnedOps.push(d);
+      };
+      // 正文和思考过程都过滤，避免指令从任何一个通道露出来；
+      // 只从正文执行指令：思考过程里可能复述提示词示例，不能当成真实记账。
+      const directiveFilter = createDirectiveFilter(collectOp);
+      const reasoningFilter = createDirectiveFilter(() => {});
       try {
-        await send('meta', { session_id: sessionId, user_message_id: userMessageId });
+        await send('meta', { session_id: sessionId, user_message_id: userMessageId, memory: mem.debug });
         const reader = upstream.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -543,15 +1110,33 @@ async function handleChat(request, env, ctx, cors, json) {
             const d = choice.delta || {};
             if (d.reasoning_content) {
               if (firstTokenMs === null) firstTokenMs = Date.now() - t0;
-              reasoning += d.reasoning_content;
-              await send('reasoning', { text: d.reasoning_content });
+              const safeReasoning = reasoningFilter.push(d.reasoning_content);
+              if (safeReasoning) {
+                reasoning += safeReasoning;
+                await send('reasoning', { text: safeReasoning });
+              }
             }
             if (d.content) {
               if (firstTokenMs === null) firstTokenMs = Date.now() - t0;
-              text += d.content;
-              await send('delta', { text: d.content });
+              // 指令在流式阶段就摘掉，气泡里不会闪现；分片切断标记时过滤器会先扣住
+              const safe = directiveFilter.push(d.content);
+              if (safe) {
+                text += safe;
+                await send('delta', { text: safe });
+              }
             }
           }
+        }
+        // 收尾：扣住的普通文本补发；没收完的指令整段丢弃
+        const safeTail = directiveFilter.end();
+        if (safeTail) {
+          text += safeTail;
+          await send('delta', { text: safeTail });
+        }
+        const reasoningTail = reasoningFilter.end();
+        if (reasoningTail) {
+          reasoning += reasoningTail;
+          await send('reasoning', { text: reasoningTail });
         }
 		if (clientGone) return; // 前端已断开：不保存回复
 		if (userMessageId !== null) {
@@ -559,6 +1144,8 @@ async function handleChat(request, env, ctx, cors, json) {
 			const still = await sb(env, 'GET', `messages?id=eq.${userMessageId}&select=id`);
 			if (!still?.length) return;
 		}
+        // 记账在确认回复要保存之后执行；失败只记日志，不影响回复
+        if (pinnedOps.length) await applyPinnedOps(env, pinnedOps);
 
         const stats = {
           model: upstreamModel,
@@ -570,6 +1157,7 @@ async function handleChat(request, env, ctx, cors, json) {
           finish_reason: finish,
         };
         let savedId = null;
+        let saveFailed = false;
         if (text || reasoning) {
           try {
             const saved = await sb(env, 'POST', 'messages', {
@@ -580,13 +1168,19 @@ async function handleChat(request, env, ctx, cors, json) {
               ...stats,
             });
             savedId = saved?.[0]?.id ?? null;
+            if (savedId === null) saveFailed = true;
             // 重新生成：新回复保存成功后，才删除旧回复（失败时旧回复不会丢）
             if (regenId !== null && savedId !== null) {
               await sb(env, 'DELETE', `messages?id=eq.${regenId}`);
             }
           } catch (e) {
             console.log('save error', e.message);
+            saveFailed = true;
           }
+        }
+        if (saveFailed) {
+          // 前端不改：把提示作为最后一段 delta 追加到界面，避免看起来像保存成功了
+          await send('delta', { text: '\n\n（这条回复没有保存到数据库，刷新后会消失）' });
         }
         await send('done', { id: savedId, ...stats });
       } catch (e) {
