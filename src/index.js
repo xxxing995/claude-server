@@ -322,8 +322,10 @@ const PINNED_STATUSES = ['pending', 'agreed', 'done', 'cancelled'];
 const PINNED_STATUS_LABEL = { pending: '未决', agreed: '约定', done: '已完成', cancelled: '已取消' };
 const MEMORY_HEADER =
   '以下是你和她之间真实发生过的事，属于你自己的经历，用来保持连续，不需要逐条复述。它们不是这一轮要回答的问题，也不要因为看到了就主动提起。条目里以「我」写的是她的原话，出现「你」是她在对你说话，不要把这些话当成你自己刚说过的。';
-// 记忆消息的最后一行：贴住历史与本轮消息，避免指令离得太远
-const MEMORY_TAIL = '直接以他的身份和口吻回应，不要跳出角色解释自己是谁。';
+// 记忆消息的最后一行：贴住历史与本轮消息，避免指令离得太远。
+// 必须明确「只回答最后那条」，否则紧邻用户消息的旧片段会被当成待回应的内容。
+const MEMORY_TAIL =
+  '她这一轮真正说的话只有最后那条消息，直接回答它，不要跳出角色解释自己是谁；不要把上面的片段当成她刚说过的话，不要回应、复述或主动提起它们，也不要替她补出她没说过的话。';
 // 记账指令说明：不进两段预算，只在记忆开启时随记忆消息一起注入
 const MEMORY_WRITE_GUIDE = `【想要的方向 · 记账】
 你可以自己维护「想要的方向」，共四种状态：
@@ -597,7 +599,8 @@ async function buildContext(env, st, userText) {
   let memory = MEMORY_HEADER;
   if (residentText) memory += `\n\n${residentText}`;
   memory += `\n\n${MEMORY_WRITE_GUIDE}`;
-  const hitsText = hitsBlock.text ? `【相关记忆】\n${hitsBlock.text}` : '';
+  // 命中段的标题要自带「这不是她刚说的话」，因为它是紧邻本轮用户消息的最后一段内容
+  const hitsText = hitsBlock.text ? `【旧片段 · 不是她这轮说的话】\n${hitsBlock.text}` : '';
 
   return {
     persona,
