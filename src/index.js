@@ -63,6 +63,42 @@ async function listModels(env, json) {
   }
 }
 
+// 会话列表：侧栏用，按最近更新排序
+async function listSessions(env, json) {
+  try {
+    const rows = await sb(
+      env,
+      'GET',
+      'sessions?select=id,name,created_at,updated_at&order=updated_at.desc&limit=200',
+    );
+    return json(rows || []);
+  } catch (e) {
+    console.log('list sessions error', e.message);
+    return json({ error: '读取会话列表失败' }, 500);
+  }
+}
+
+// 某个会话的历史消息：只读可见的 user/assistant 消息，按时间正序；
+// 顺带用同一次请求取回会话的 updated_at（由 touch_session 触发器维护），给前端显示“上次更新”
+async function listMessages(env, sessionId, json) {
+  try {
+    const rows = await sb(
+      env,
+      'GET',
+      `messages?session_id=eq.${sessionId}&visible=eq.true&role=in.(user,assistant)` +
+        '&select=id,role,content,reasoning_content,model,first_token_ms,total_ms,prompt_tokens,completion_tokens,total_tokens,finish_reason,sessions(updated_at)' +
+        '&order=id.asc',
+    );
+    const list = rows || [];
+    const rel = list[0]?.sessions;
+    const updated_at = (Array.isArray(rel) ? rel[0]?.updated_at : rel?.updated_at) || null;
+    return json({ updated_at, messages: list.map(({ sessions, ...m }) => m) });
+  } catch (e) {
+    console.log('list messages error', e.message);
+    return json({ error: '读取历史消息失败' }, 500);
+  }
+}
+
 // 清理接口地址：必须 https，去掉结尾的 / 和 /v1
 function cleanBaseUrl(v) {
   const s = typeof v === 'string' ? v.trim().slice(0, 200).replace(/\/+$/, '').replace(/\/v1$/, '') : '';
@@ -261,7 +297,15 @@ async function handleApi(request, env, ctx, url) {
   if (path === '/api/chat/retract' && request.method === 'POST') {
 	return handleRetract(request, env, json);
   }
-  let m = path.match(/^\/api\/messages\/(\d+)$/);
+  if (path === '/api/sessions' && request.method === 'GET') {
+	return listSessions(env, json);
+  }
+  let m = path.match(/^\/api\/sessions\/(\d+)\/messages$/);
+  if (m && request.method === 'GET') {
+	return listMessages(env, m[1], json);
+  }
+  m = path.match(/^\/api\/messages\/(\d+)$/);
+  if (m && request.method === 'DELETE') return removeRow(env, 'messages', m[1], json);
   if (path === '/api/models') {
 	if (request.method === 'GET') return listModels(env, json);
 
@@ -271,7 +315,7 @@ async function handleApi(request, env, ctx, url) {
 	}
   }
   m = path.match(/^\/api\/sessions\/(\d+)$/);
-  if (m && request.method === 'DELETE') return removeRow(env, 'sessions', m[1], json);
+  if (m && request.method === 'DELETE') return deleteSession(env, m[1], json);
 	if (path === '/api/providers') {
 	if (request.method === 'GET') return listProviders(env, json);
 	if (request.method === 'POST') return saveProvider(request, env, json, null);
@@ -298,6 +342,19 @@ async function removeRow(env, table, id, json) {
     console.log('delete error', e.message);
     return json({ error: '数据库删除失败' }, 500);
   }
+}
+
+// 删除会话：先显式删掉它的消息，再删会话本身。
+// 数据库里 messages.session_id 虽然声明了级联删除，但仓库里没有 SQL 可以核实，
+// 这里显式清理一次，避免留下孤儿消息。
+async function deleteSession(env, id, json) {
+  try {
+    await sb(env, 'DELETE', `messages?session_id=eq.${id}`);
+  } catch (e) {
+    console.log('delete session messages error', e.message);
+    return json({ error: '数据库删除失败' }, 500);
+  }
+  return removeRow(env, 'sessions', id, json);
 }
 
 // 撤回一轮：删掉这条用户消息，以及它之后的所有消息（即它的回复）；会话空了就一并删掉
